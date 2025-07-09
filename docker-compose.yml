@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  jwst-bot:
+    build: .
+    container_name: jwst-telegram-bot
+    restart: always
+    volumes:
+      - .:/app
+      - bot_logs:/app/bot_logs
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+
+volumes:
+  bot_logs:
