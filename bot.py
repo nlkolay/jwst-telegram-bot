@@ -1,234 +1,222 @@
 import logging
-import feedparser
-from deep_translator import GoogleTranslator
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-import numpy as np
-from astropy.coordinates import get_body_barycentric_posvel, solar_system_ephemeris
-from astropy.time import Time
-import matplotlib.pyplot as plt
-from astroquery.jplhorizons import Horizons
-import astropy.units as u
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from database import init_db, subscribe_user, unsubscribe_user, get_subscribed_users
+import json
+import os
+import random
+import datetime
+import asyncio
+import html
+from io import BytesIO
+import requests
+from PIL import Image
+from telegram import Update, BotCommand, InputMediaPhoto
+from telegram.ext import Application, CommandHandler, ContextTypes, JobQueue
 
-# Enable logging
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO,
-    filename='bot.log', filemode='a'
-)
+from logger_config import setup_logging
+from position import create_jwst_orbit_plot
+import news
+from news import get_latest_news
+
+setup_logging()
 logger = logging.getLogger(__name__)
 
-# Replace with your bot token
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
+CAPTION_LIMIT = 1024
+
+def load_config():
+    try:
+        with open('config.json', 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logger.critical("Файл config.json не найден!")
+        exit()
+    except json.JSONDecodeError:
+        logger.critical("Ошибка в синтаксисе файла config.json.")
+        exit()
+
+async def post_init(application: Application) -> None:
+    commands = [
+        BotCommand("start", "🚀 Перезапустить бота"),
+        BotCommand("latest_image", "🖼️ Последнее изображение"),
+        BotCommand("news", "📰 Последние новости"),
+        BotCommand("position", "🛰️ Схема положения в космосе"),
+        BotCommand("fact", "💡 Случайный факт о телескопе"),
+        BotCommand("help", "ℹ️ Помощь по командам"),
+    ]
+    await application.bot.set_my_commands(commands)
+    logger.info("Команды бота успешно установлены.")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a welcome message when the command /start is issued."""
     user = update.effective_user
     await update.message.reply_html(
-        f"Hi {user.mention_html()}! Welcome to the JWST Bot. I can provide you with the latest news, images, and telemetry from the James Webb Space Telescope.",
+        f"Привет, {user.mention_html()}\n\n"
+        "Я бот, который расскажет всё о космическом телескопе «Джеймс Уэбб».\n"
+        "Используйте /help, чтобы увидеть список всех команд."
     )
 
-async def fetch_nasa_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fetches and displays the latest NASA news."""
-    await update.message.reply_text("Fetching NASA news...")
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    commands = await context.bot.get_my_commands()
+    help_text = "<b>Доступные команды:</b>\n\n"
+    help_text += "\n".join(f"/{command.command} - {command.description}" for command in commands)
+    await update.message.reply_html(help_text, disable_web_page_preview=True)
+
+async def latest_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="TYPING")
     try:
-        feed = feedparser.parse("https://www.nasa.gov/feed/")
-        news_items = []
-        for entry in feed.entries[:5]:  # Get top 5 news items
-            title = GoogleTranslator(source='auto', target='ru').translate(entry.title)
-            summary = GoogleTranslator(source='auto', target='ru').translate(entry.summary)
-            news_items.append(f"<b>{title}</b>\n{summary}\n")
-        
-        if news_items:
-            await update.message.reply_html("\n".join(news_items))
+        image_info = await asyncio.to_thread(news.get_latest_image)
+        if image_info and image_info.get('image_url'):
+            caption = f"<b>{html.escape(image_info['title'])}</b>\n\n" \
+                      f"{html.escape(image_info['description'])}\n\n" \
+                      f"<i>Дата: {image_info['date']}</i>\n" \
+                      f"<a href=\"{image_info['link']}\">Источник</a>"
+
+            if len(caption) > CAPTION_LIMIT:
+                caption = caption[:CAPTION_LIMIT - 3] + "..."
+
+            await update.message.reply_photo(
+                photo=image_info['image_url'],
+                caption=caption,
+                parse_mode='HTML'
+            )
         else:
-            await update.message.reply_text("Could not fetch NASA news at this time.")
+            await update.message.reply_text("Не удалось получить последнее изображение. Попробуйте позже.")
     except Exception as e:
-        logger.error(f"Error fetching NASA news: {e}")
-        await update.message.reply_text("An error occurred while fetching NASA news.")
+        logger.error(f"Ошибка при получении изображения: {e}", exc_info=True)
+        await update.message.reply_text("Произошла внутренняя ошибка при получении изображения. Администратор уже уведомлен.")
 
-async def fetch_nasa_iotd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fetches and displays the NASA Image of the Day."""
-    await update.message.reply_text("Fetching NASA Image of the Day...")
+async def get_news(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="TYPING")
     try:
-        feed = feedparser.parse("https://www.nasa.gov/feeds/iotd-feed/")
-        if feed.entries:
-            entry = feed.entries[0]  # Get the latest image
-            title = GoogleTranslator(source='auto', target='ru').translate(entry.title)
-            
-            # Extract image URL from media_content or summary
-            image_url = None
-            if 'media_content' in entry and entry.media_content:
-                for media in entry.media_content:
-                    if media.get('type', '').startswith('image'):
-                        image_url = media.get('url')
-                        break
-            
-            if not image_url and 'summary' in entry:
-                # Try to extract image from summary HTML
-                import re
-                match = re.search(r'<img src="(.*?)"', entry.summary)
-                if match:
-                    image_url = match.group(1)
+        latest_news = await asyncio.to_thread(get_latest_news, limit=5)
+        if latest_news:
+            for news_item in latest_news:
+                text_caption = (f"<b>{html.escape(news_item['title'])}</b>\n\n"
+                                f"{html.escape(news_item['description'])} \n\n"
+                                f"<i>Дата: {news_item['date']}</i>\n"
+                                f"<a href=\"{news_item['link']}\">Читать далее</a>")
 
-            description = entry.summary
-            # Extract first two sentences for description
-            sentences = re.split(r'(?<=[.!?])\s+', description)
-            short_description = " ".join(sentences[:2])
-            translated_description = GoogleTranslator(source='auto', target='ru').translate(short_description)
+                if news_item.get('image_urls'):
+                    media_group = []
+                    for i, image_url in enumerate(news_item['image_urls'][:10]):
+                        try:
+                            response = await asyncio.to_thread(requests.get, image_url, {'timeout': 15})
+                            response.raise_for_status()
+                            content_type = response.headers.get('Content-Type', '')
 
-            message = f"<b>{title}</b>\n\n{translated_description}"
-            if image_url:
-                await update.message.reply_photo(photo=image_url, caption=message, parse_mode='HTML')
-            else:
-                await update.message.reply_html(message)
+                            if 'image' not in content_type:
+                                logger.warning(f"Skipping non-image URL: {image_url} (Content-Type: {content_type})")
+                                continue
+
+                            image_content = BytesIO(response.content)
+
+                            # --- Image Resizing Logic ---
+                            image_content.seek(0)
+                            img = Image.open(image_content)
+                            
+                            # Resize if the image is large to save memory
+                            if img.width > 1280 or img.height > 1280:
+                                img.thumbnail((1280, 1280))
+                                resized_content = BytesIO()
+                                img.save(resized_content, format='JPEG')
+                                resized_content.seek(0)
+                                image_content = resized_content
+                            else:
+                                image_content.seek(0)
+                            # --- End Resizing Logic ---
+
+                            caption = text_caption if i == 0 else None
+                            if caption and len(caption) > CAPTION_LIMIT:
+                                caption = caption[:CAPTION_LIMIT - 3] + "..."
+                            
+                            media_group.append(InputMediaPhoto(media=image_content, caption=caption, parse_mode='HTML'))
+
+                        except requests.exceptions.RequestException as e:
+                            logger.warning(f"Failed to download image {image_url}: {e}")
+                        except Exception as e:
+                            logger.error(f"An unexpected error occurred while processing image {image_url}: {e}")
+
+                    if media_group:
+                        await update.message.reply_media_group(media=media_group)
+                    else:
+                        await update.message.reply_text(text=text_caption, parse_mode='HTML', disable_web_page_preview=True)
+                else:
+                    await update.message.reply_text(text=text_caption, parse_mode='HTML', disable_web_page_preview=True)
         else:
-            await update.message.reply_text("Could not fetch NASA Image of the Day at this time.")
+            await update.message.reply_text("Не удалось найти последние новости о телескопе Уэбба.")
     except Exception as e:
-        logger.error(f"Error fetching NASA Image of the Day: {e}")
-        await update.message.reply_text("An error occurred while fetching NASA Image of the Day.")
+        logger.error(f"Ошибка при получении новостей: {e}", exc_info=True)
+        await update.message.reply_text("Произошла внутренняя ошибка при получении новостей. Администратор уже уведомлен.")
 
-async def jwst_orbit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Fetches and displays the JWST orbit relative to Earth and Moon."""
-    await update.message.reply_text("Fetching JWST orbital data and generating plot. This may take a moment...")
+async def get_position(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="TYPING")
+    await update.message.reply_text("🛰️ Генерирую схему положения в космосе. Это может занять до одной минуты...")
     try:
-        # Define time range (e.g., 30 days around current date)
-        t_now = Time.now()
-        t_start = t_now - 15 * u.day
-        t_end = t_now + 15 * u.day
-        times = Time(np.linspace(t_start.jd, t_end.jd, 100), format='jd')
-
-        # Query JPL Horizons for Earth, Moon, and JWST
-        # Earth (body ID 399)
-        earth = Horizons(id='399', location='@ssb', epochs=times.jd).vectors()
-        earth_pos = earth['x', 'y', 'z'].quantity
-
-        # Moon (body ID 301)
-        moon = Horizons(id='301', location='@ssb', epochs=times.jd).vectors()
-        moon_pos = moon['x', 'y', 'z'].quantity
-
-        # JWST (body ID -170)
-        jwst = Horizons(id='-170', location='@ssb', epochs=times.jd).vectors()
-        jwst_pos = jwst['x', 'y', 'z'].quantity
-
-        # Convert to Earth-centered coordinates
-        jwst_rel_earth = jwst_pos - earth_pos
-        moon_rel_earth = moon_pos - earth_pos
-
-        # Plotting
-        plt.style.use('dark_background')
-        fig, ax = plt.subplots(figsize=(10, 10))
-        ax.set_aspect('equal')
-
-        # Plot Earth (at origin)
-        ax.plot(0, 0, 'o', color='blue', markersize=10, label='Earth')
-
-        # Plot Moon orbit
-        ax.plot(moon_rel_earth.x.to(u.km).value, moon_rel_earth.y.to(u.km).value, '--', color='gray', label='Moon Orbit')
-        ax.plot(moon_rel_earth.x[-1].to(u.km).value, moon_rel_earth.y[-1].to(u.km).value, 'o', color='lightgray', markersize=5, label='Moon')
-
-        # Plot JWST orbit
-        ax.plot(jwst_rel_earth.x.to(u.km).value, jwst_rel_earth.y.to(u.km).value, '-', color='red', label='JWST Orbit')
-        ax.plot(jwst_rel_earth.x[-1].to(u.km).value, jwst_rel_earth.y[-1].to(u.km).value, 'x', color='orange', markersize=8, label='JWST')
-
-        # Set limits and labels
-        max_range = max(np.max(np.abs(jwst_rel_earth.x.to(u.km).value)), np.max(np.abs(jwst_rel_earth.y.to(u.km).value)))
-        max_range = max(max_range, np.max(np.abs(moon_rel_earth.x.to(u.km).value)), np.max(np.abs(moon_rel_earth.y.to(u.km).value)))
+        plot_path = await asyncio.to_thread(create_jwst_orbit_plot)
         
-        # Add some padding
-        padding = max_range * 0.1
-        ax.set_xlim(-max_range - padding, max_range + padding)
-        ax.set_ylim(-max_range - padding, max_range + padding)
-
-        ax.set_xlabel('X (km)')
-        ax.set_ylabel('Y (km)')
-        ax.set_title('JWST and Moon Orbit Relative to Earth')
-        ax.legend()
-        ax.grid(True, linestyle='--', alpha=0.6)
-
-        # Add grid in thousands of km
-        # Calculate appropriate tick interval based on max_range
-        tick_interval = 10**(np.floor(np.log10(max_range / 5)) + 3) # Roughly 5 ticks
-        if tick_interval < 1000: # Ensure at least 1000 km interval
-            tick_interval = 1000
-
-        x_ticks = np.arange(ax.get_xlim()[0], ax.get_xlim()[1], tick_interval)
-        y_ticks = np.arange(ax.get_ylim()[0], ax.get_ylim()[1], tick_interval)
-        ax.set_xticks(x_ticks)
-        ax.set_yticks(y_ticks)
-        ax.ticklabel_format(style='plain', axis='both', useOffset=False)
-
-        # Save plot to a temporary file
-        plot_path = "jwst_orbit.png"
-        plt.savefig(plot_path)
-        plt.close(fig)
-
-        # Send the plot to the user
-        await update.message.reply_photo(photo=open(plot_path, 'rb'))
-
+        if plot_path == "JPL_ERROR":
+            await update.message.reply_text("Не удалось связаться с серверами NASA (JPL Horizons) для получения данных. Попробуйте позже.")
+        elif plot_path and os.path.exists(plot_path):
+            await update.message.reply_photo(
+                photo=open(plot_path, 'rb'),
+                caption="Схема орбит JWST и Луны относительно Земли."
+            )
+            os.remove(plot_path) # Удаляем файл после отправки
+        else:
+            await update.message.reply_text("Не удалось создать схему из-за внутренней ошибки. Попробуйте позже.")
     except Exception as e:
-        logger.error(f"Error generating JWST orbit plot: {e}")
-        await update.message.reply_text("An error occurred while generating the JWST orbit plot. This feature requires `astropy` and `astroquery` to be correctly installed and configured, and may also be affected by network issues when querying JPL Horizons.")
+        logger.error(f"Ошибка при вызове команды /position: {e}", exc_info=True)
+        await update.message.reply_text("Произошла внутренняя ошибка при создании схемы. Администратор уже уведомлен.")
 
-async def subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    subscribe_user(user_id)
-    await update.message.reply_text("You have been subscribed to daily updates!")
+JWST_FACTS = [
+    "Главное зеркало телескопа «Джеймс Уэбб» состоит из 18 шестиугольных сегментов, покрытых тонким слоем золота для оптимального отражения инфракрасного света.",
+    "Телескоп находится в точке Лагранжа L2 на расстоянии около 1,5 миллиона километров от Земли, что позволяет ему оставаться холодным и защищенным от солнечного света.",
+]
 
-async def unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    unsubscribe_user(user_id)
-    await update.message.reply_text("You have been unsubscribed from updates.")
+async def get_fact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    fact = random.choice(JWST_FACTS)
+    await update.message.reply_text(f"<b>💡 Интересный факт:</b>\n\n{fact}", parse_mode='HTML')
 
-async def set_frequency(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    args = context.args
-    if not args or len(args) != 1:
-        await update.message.reply_text("Usage: /set_frequency <daily|weekly>")
-        return
-    
-    frequency = args[0].lower()
-    if frequency not in ['daily', 'weekly']:
-        await update.message.reply_text("Invalid frequency. Please choose 'daily' or 'weekly'.")
-        return
-    
-    subscribe_user(user_id, frequency) # Update frequency for existing subscription or create new one
-    await update.message.reply_text(f"Your update frequency has been set to {frequency}.")
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log Errors caused by Updates."""
+    logger.error("Exception while handling an update:", exc_info=context.error)
 
-async def send_daily_update(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Sends a daily update to all subscribed users."""
-    users = get_subscribed_users()
-    for user_id, frequency in users:
-        if frequency == 'daily':
-            try:
-                # For now, just send a placeholder message. Later, integrate news/iotd/telemetry.
-                await context.bot.send_message(chat_id=user_id, text="Daily update: More exciting JWST content coming soon!")
-            except Exception as e:
-                logger.error(f"Could not send daily update to user {user_id}: {e}")
+
+# ... (остальной код)
 
 def main() -> None:
     """Start the bot."""
-    init_db()
-    # Create the Application and pass it your bot's token.
-    application = Application.builder().token(BOT_TOKEN).build()
+    config = load_config()
+    token = config.get("telegram_token")
 
-    # Initialize scheduler
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(send_daily_update, 'cron', hour=10, minute=0, args=[application.bot]) # Run daily at 10:00 AM UTC
-    scheduler.start()
+    if not token or token == "YOUR_TELEGRAM_BOT_TOKEN_HERE":
+        logger.critical("Токен Telegram не найден в config.json. Пожалуйста, добавьте его.")
+        return
+
+    logger.info("Creating JobQueue...")
+    job_queue = JobQueue()
+    logger.info("Building Application...")
+    application = (
+        Application.builder()
+        .token(token)
+        .job_queue(job_queue)
+        .post_init(post_init)
+        .build()
+    )
+    logger.info("Application built successfully.")
 
     # on different commands - add handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("news", fetch_nasa_news))
-    application.add_handler(CommandHandler("iotd", fetch_nasa_iotd))
-    application.add_handler(CommandHandler("jwst_orbit", jwst_orbit))
-    application.add_handler(CommandHandler("subscribe", subscribe))
-    application.add_handler(CommandHandler("unsubscribe", unsubscribe))
-    application.add_handler(CommandHandler("set_frequency", set_frequency))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("latest_image", latest_image))
+    application.add_handler(CommandHandler("news", get_news))
+    application.add_handler(CommandHandler("position", get_position))
+    application.add_handler(CommandHandler("fact", get_fact))
+
+    # log all errors
+    application.add_error_handler(error_handler)
 
     # Run the bot until the user presses Ctrl-C
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Бот запускается...")
+    application.run_polling()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     main()
